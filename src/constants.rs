@@ -1,0 +1,1 @@
+pub const SOLAR_VISMAG: f64 = -26.74; // Solar visual magnitude
