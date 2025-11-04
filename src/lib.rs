@@ -1,5 +1,6 @@
 pub mod functions;
 pub mod constants;
+pub mod entities;
 
 #[cfg(test)]
 mod tests {

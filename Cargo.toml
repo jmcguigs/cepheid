@@ -1,6 +1,6 @@
 [package]
 name = "cepheid"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A Rust library for working with lightcurve data"
 license = "MIT"
@@ -10,3 +10,4 @@ keywords = ["photometry", "vismag", "lightcurve"]
 categories = ["science"]
 
 [dependencies]
+chrono = { version = "0.4" }
