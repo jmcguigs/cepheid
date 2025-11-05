@@ -9,14 +9,14 @@ impl StringLengthPeriodEstimator {
     // generate trial periods between min and max with given max fractional error
     fn generate_trial_periods(lightcurve: &Lightcurve, min_period: f64, max_period: f64, max_fractional_error: f64) -> Vec<f64> {
         let mut trial_periods = Vec::new();
+        let data_span_s = lightcurve.data_span_s();
         let mut period = min_period;
-        let obs_by_time = lightcurve.observations_sorted_by_time();
-        let data_span_s = obs_by_time.last().unwrap().timestamp.timestamp() as f64 - obs_by_time.first().unwrap().timestamp.timestamp() as f64;
         while period <= max_period {
             trial_periods.push(period);
-            let fractional_error = period / data_span_s;
-            // increment period based on max fractional error
-            period += period * max_fractional_error / fractional_error;
+            // Increment by fractional error across the total number of cycles in data span
+            let num_cycles = data_span_s / period;
+            let fractional_increment = max_fractional_error / num_cycles;
+            period += period * fractional_increment;
         }
         trial_periods
     }
@@ -32,12 +32,17 @@ impl StringLengthPeriodEstimator {
             .collect();
         // sort by phase
         folded_obs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        // compute string length
+        // compute string length - handle wrap-around
         let mut string_length = 0.0;
         for i in 0..folded_obs.len() {
             let (obs_a, phase_a) = folded_obs[i];
             let (obs_b, phase_b) = folded_obs[(i + 1) % folded_obs.len()];
-            let delta_phase = phase_b - phase_a;
+            let delta_phase = if i == folded_obs.len() - 1 {
+                // wrap-around case
+                (phase_b + 1.0) - phase_a
+            } else {
+                phase_b - phase_a
+            };
             let delta_mag = obs_b.std_magnitude - obs_a.std_magnitude;
             string_length += (delta_phase.powi(2) + delta_mag.powi(2)).sqrt();
         }

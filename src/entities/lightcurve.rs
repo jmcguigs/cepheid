@@ -35,4 +35,32 @@ impl Lightcurve {
         });
         obs_refs
     }
+
+    pub fn data_span_s(&self) -> f64 {
+        let obs_by_time = self.observations_sorted_by_time();
+        (obs_by_time.last().unwrap().timestamp.timestamp_micros() as f64 
+            - obs_by_time.first().unwrap().timestamp.timestamp_micros() as f64) / 1_000_000.0
+    }
+
+    pub fn observation_count(&self) -> usize {
+        self.observations.len()
+    }
+
+    pub fn update_period(&mut self, period_sec: Option<f64>) {
+        self.period_sec = period_sec;
+        self.is_periodic = period_sec.map(|_| true);
+
+        // update fractional periods for observations - if None, set to None
+        if let Some(period) = period_sec {
+            for obs in &mut self.observations {
+                let timestamp_unix = obs.timestamp.timestamp_micros() as f64 / 1_000_000.0;
+                obs.fractional_period = Some((timestamp_unix % period) / period);
+            }
+        }
+        else {
+            for obs in &mut self.observations {
+                obs.fractional_period = None;
+            }
+        }
+    }
 }
