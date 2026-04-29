@@ -37,6 +37,10 @@ impl Observation {
         }
     }
 
+    pub fn unix_seconds(&self) -> f64 {
+        self.timestamp.timestamp_micros() as f64 / 1_000_000.0
+    }
+
     pub fn new_default_normalization(vismag: f64, range_m: f64, phase_rad: f64, timestamp: DateTime<Utc>) -> Self {
         // new with default std range 1000 km and std phase 90 deg
         let std_magnitude = crate::functions::normalization::normalize_vismag(
