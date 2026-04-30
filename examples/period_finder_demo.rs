@@ -77,7 +77,7 @@ fn main() {
     );
 
     let gp = QuasiPeriodicGPPeriodEstimator::estimate_period(
-        &lightcurve, min_p, max_p, max_frac_err, None, None, None,
+        &lightcurve, min_p, max_p, max_frac_err, None, None, None, None,
     );
     println!(
         "Quasi-periodic GP     : {:?} (log odds = {:.2})",

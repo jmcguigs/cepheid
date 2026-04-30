@@ -1,6 +1,9 @@
 use crate::entities::observation::Observation;
 use crate::entities::lightcurve::Lightcurve;
+use nalgebra::{DMatrix, DVector};
+use rand::SeedableRng;
 use rand::prelude::SliceRandom;
+use rand::rngs::StdRng;
 use rayon::prelude::*;
 
 /// Generate a trial-period grid bounded by `max_trials`.
@@ -370,8 +373,11 @@ pub struct QuasiPeriodicGPResult {
 impl QuasiPeriodicGPPeriodEstimator {
     /// Run the estimator. Defaults: hyperparams derived from data
     /// (L = span/2, λ = 1.0, σ_f² = 0.95·var(y), σ_n² = 0.05·var(y));
-    /// `log_odds_threshold` = 5.0; `max_trial_periods` = 1000 (lower than
-    /// G-L's 5000 because each evaluation is an O(N³) Cholesky).
+    /// `log_odds_threshold` = 5.0; `max_trial_periods` = 1000 (split between a
+    /// 200-point coarse log-spaced scan and ~800 fine trials around the top-5
+    /// coarse peaks); `max_obs` = 600 (each evaluation is an O(N³) Cholesky,
+    /// so we uniform-randomly subsample down to this cap when the lightcurve
+    /// is larger).
     pub fn estimate_period(
         lightcurve: &Lightcurve,
         min_period: f64,
@@ -380,12 +386,24 @@ impl QuasiPeriodicGPPeriodEstimator {
         hyperparams: Option<QuasiPeriodicGPHyperparams>,
         log_odds_threshold: Option<f64>,
         max_trial_periods: Option<usize>,
+        max_obs: Option<usize>,
     ) -> QuasiPeriodicGPResult {
         let log_odds_threshold = log_odds_threshold.unwrap_or(5.0);
         let max_trials = max_trial_periods.unwrap_or(1000);
+        let max_obs = max_obs.unwrap_or(600).max(10);
 
-        let n = lightcurve.observations.len();
-        let hp = hyperparams.unwrap_or_else(|| default_qp_hyperparams(lightcurve));
+        // Subsample if needed — uniform random selection seeded for reproducibility.
+        let subsampled;
+        let lc: &Lightcurve = if lightcurve.observations.len() > max_obs {
+            subsampled = subsample_lightcurve(lightcurve, max_obs, 0xC0FFEE_u64);
+            &subsampled
+        } else {
+            lightcurve
+        };
+
+        let n = lc.observations.len();
+        let hp =
+            hyperparams.unwrap_or_else(|| default_qp_hyperparams(lc, min_period, max_period));
 
         if n < 10 {
             return QuasiPeriodicGPResult {
@@ -398,42 +416,82 @@ impl QuasiPeriodicGPPeriodEstimator {
 
         // Center t at the first observation for numerical stability — exp((Δt)²)
         // with raw unix seconds would silently underflow long before Cholesky.
-        let t0 = lightcurve
+        let t0 = lc
             .observations
             .iter()
             .map(|o| o.unix_seconds())
             .fold(f64::INFINITY, f64::min);
-        let t: Vec<f64> = lightcurve
+        let t: Vec<f64> = lc
             .observations
             .iter()
             .map(|o| o.unix_seconds() - t0)
             .collect();
         let mean_y: f64 =
-            lightcurve.observations.iter().map(|o| o.std_magnitude).sum::<f64>() / n as f64;
-        let y: Vec<f64> = lightcurve
+            lc.observations.iter().map(|o| o.std_magnitude).sum::<f64>() / n as f64;
+        let y_vec: Vec<f64> = lc
             .observations
             .iter()
             .map(|o| o.std_magnitude - mean_y)
             .collect();
-        let var_y = y.iter().map(|v| v * v).sum::<f64>() / (n - 1).max(1) as f64;
+        let var_y = y_vec.iter().map(|v| v * v).sum::<f64>() / (n - 1).max(1) as f64;
+
+        // Cache the dt and SE-component matrices once. Both are
+        // period-independent — only the periodic factor exp(-2sin²(πΔt/P)/λ²)
+        // changes per trial. Saves N²·N_trials sin/exp evaluations.
+        let (dt_mat, se_mat) = build_dt_and_se_matrices(&t, &hp);
+        let y_dvec = DVector::from_column_slice(&y_vec);
 
         // Baseline: i.i.d. Gaussian with variance = sample variance of y. This
         // tests "does adding QP structure beat treating the data as pure noise?"
         // — appropriate when σ_f² may be near zero (true white noise input).
-        let log_ml_baseline = noise_only_log_marginal_likelihood(&y, var_y.max(1.0e-12));
+        let log_ml_baseline = noise_only_log_marginal_likelihood(&y_vec, var_y.max(1.0e-12));
 
-        let trials = trial_periods(lightcurve, min_period, max_period, max_fractional_error, max_trials);
-        let n_trials = trials.len().max(1);
-        let lep = (n_trials as f64).ln();
+        // Coarse log-spaced scan to localize peaks cheaply, then refine adaptive
+        // trials around the top-K. Each Cholesky is O(N³), so we'd rather spend
+        // 1000 trials targeted than 1000 trials uniformly across the range.
+        let n_coarse = (max_trials / 5).max(100).min(max_trials);
+        let coarse_trials = log_spaced_grid(min_period, max_period, n_coarse);
 
-        let periodogram: Vec<(f64, f64)> = trials
-            .par_iter()
-            .map(|&p| {
-                let gram = build_gram_qp(&t, p, &hp);
-                let log_ml = gp_log_marginal_likelihood(gram, &y);
-                (p, log_ml - log_ml_baseline - lep)
-            })
+        let evaluate = |trials: &[f64]| -> Vec<(f64, f64)> {
+            trials
+                .par_iter()
+                .map(|&p| {
+                    let log_ml = qp_log_marginal_likelihood_cached(&dt_mat, &se_mat, &y_dvec, p, &hp);
+                    (p, log_ml - log_ml_baseline)
+                })
+                .collect()
+        };
+
+        let coarse_pgram = evaluate(&coarse_trials);
+
+        // Top-K peaks by score among local maxima (with endpoint fallback).
+        let n_peaks = 5;
+        let peaks = top_k_peaks(&coarse_pgram, n_peaks);
+
+        let span_s = lightcurve.data_span_s().max(1.0);
+        let fine_budget = max_trials.saturating_sub(n_coarse);
+        let fine_per_peak = if peaks.is_empty() {
+            0
+        } else {
+            (fine_budget / peaks.len()).max(20)
+        };
+        let fine_trials: Vec<f64> = peaks
+            .iter()
+            .flat_map(|&peak| refine_around(peak, max_fractional_error, span_s, fine_per_peak, min_period, max_period))
             .collect();
+        let fine_pgram = evaluate(&fine_trials);
+
+        let mut periodogram: Vec<(f64, f64)> = coarse_pgram;
+        periodogram.extend(fine_pgram);
+        periodogram.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Look-elsewhere correction: penalize for the total number of trials
+        // actually evaluated (coarse + fine).
+        let n_total = periodogram.len().max(1);
+        let lep = (n_total as f64).ln();
+        for entry in periodogram.iter_mut() {
+            entry.1 -= lep;
+        }
 
         let (best_period, best_log_odds) = periodogram.par_iter().copied().reduce(
             || (f64::NAN, f64::NEG_INFINITY),
@@ -460,7 +518,95 @@ impl QuasiPeriodicGPPeriodEstimator {
     }
 }
 
-fn default_qp_hyperparams(lc: &Lightcurve) -> QuasiPeriodicGPHyperparams {
+fn subsample_lightcurve(lc: &Lightcurve, n: usize, seed: u64) -> Lightcurve {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut indices: Vec<usize> = (0..lc.observations.len()).collect();
+    indices.shuffle(&mut rng);
+    indices.truncate(n);
+    let observations: Vec<Observation> =
+        indices.iter().map(|&i| lc.observations[i].clone()).collect();
+    Lightcurve::new(observations, lc.is_periodic, lc.period_sec)
+}
+
+fn top_k_peaks(periodogram: &[(f64, f64)], k: usize) -> Vec<f64> {
+    let n = periodogram.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n <= 2 {
+        return periodogram.iter().map(|&(p, _)| p).collect();
+    }
+
+    let mut peaks: Vec<(f64, f64)> = Vec::new();
+    for i in 1..(n - 1) {
+        if periodogram[i].1 > periodogram[i - 1].1 && periodogram[i].1 > periodogram[i + 1].1 {
+            peaks.push(periodogram[i]);
+        }
+    }
+    if periodogram[0].1 > periodogram[1].1 {
+        peaks.push(periodogram[0]);
+    }
+    if periodogram[n - 1].1 > periodogram[n - 2].1 {
+        peaks.push(periodogram[n - 1]);
+    }
+
+    // Fallback: if no local maxima (monotone signal), take top-K by score.
+    if peaks.is_empty() {
+        peaks = periodogram.to_vec();
+    }
+
+    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    peaks.truncate(k);
+    peaks.into_iter().map(|(p, _)| p).collect()
+}
+
+fn refine_around(
+    peak: f64,
+    max_frac_err: f64,
+    span_s: f64,
+    n_target: usize,
+    bound_min: f64,
+    bound_max: f64,
+) -> Vec<f64> {
+    if n_target == 0 {
+        return Vec::new();
+    }
+    // ±5% window around the coarse peak — wide enough to bracket the true peak
+    // given a coarse log-spaced grid of ~200 points across 3 orders of magnitude
+    // (each coarse spacing is ~3.5%).
+    let window = 0.05;
+    let lo = (peak * (1.0 - window)).max(bound_min);
+    let hi = (peak * (1.0 + window)).min(bound_max);
+    if hi <= lo {
+        return Vec::new();
+    }
+
+    // Try the adaptive grid first; in narrow windows it's typically far denser
+    // than n_target, so we cap. If it's sparser (very long periods), fall back
+    // to a linear grid with exactly n_target points.
+    let mut periods = Vec::new();
+    let mut p = lo;
+    while p <= hi && periods.len() < n_target {
+        periods.push(p);
+        let n_cycles = (span_s / p).max(1.0);
+        let increment = p * max_frac_err / n_cycles;
+        if increment <= 0.0 {
+            break;
+        }
+        p += increment;
+    }
+    if periods.len() < n_target {
+        let step = (hi - lo) / (n_target - 1).max(1) as f64;
+        periods = (0..n_target).map(|i| lo + i as f64 * step).collect();
+    }
+    periods
+}
+
+fn default_qp_hyperparams(
+    lc: &Lightcurve,
+    min_period_s: f64,
+    max_period_s: f64,
+) -> QuasiPeriodicGPHyperparams {
     let n = lc.observations.len();
     let mags: Vec<f64> = lc.observations.iter().map(|o| o.std_magnitude).collect();
     let mean = if n == 0 { 0.0 } else { mags.iter().sum::<f64>() / n as f64 };
@@ -479,8 +625,19 @@ fn default_qp_hyperparams(lc: &Lightcurve) -> QuasiPeriodicGPHyperparams {
     let noise_variance = consecutive_pair_noise_variance(lc).clamp(1.0e-12, var);
     let signal_variance = (var - noise_variance).max(1.0e-6 * var);
 
+    // SE envelope length: bridge a few periods so the GP can fit intra-pass
+    // periodicity, but don't span the full campaign. When observations come
+    // in passes separated by hours/days (the common case for satellite
+    // photometry), an L on the order of the campaign span tells the kernel
+    // to expect strong cross-pass correlation that doesn't actually exist —
+    // every off-diagonal pair then contributes a wrong-correlation penalty
+    // and log-likelihood collapses. Capped at min_period below to prevent
+    // L < P, which would let the SE envelope decay before periodicity has
+    // a chance to manifest.
+    let length_scale_s = (3.0 * max_period_s).clamp(min_period_s, span);
+
     QuasiPeriodicGPHyperparams {
-        length_scale_s: span / 2.0,
+        length_scale_s,
         harmonic_scale: 1.0,
         signal_variance,
         noise_variance,
@@ -507,83 +664,74 @@ fn noise_only_log_marginal_likelihood(y: &[f64], variance: f64) -> f64 {
     -0.5 * ss / variance - 0.5 * n * (2.0 * std::f64::consts::PI * variance).ln()
 }
 
-fn qp_kernel(dt: f64, period: f64, hp: &QuasiPeriodicGPHyperparams) -> f64 {
-    let two_l2 = 2.0 * hp.length_scale_s * hp.length_scale_s;
-    let lambda2 = hp.harmonic_scale * hp.harmonic_scale;
-    let se = (-(dt * dt) / two_l2).exp();
-    let arg = std::f64::consts::PI * dt / period;
-    let per = (-2.0 * arg.sin().powi(2) / lambda2).exp();
-    hp.signal_variance * se * per
-}
-
-fn build_gram_qp(t: &[f64], period: f64, hp: &QuasiPeriodicGPHyperparams) -> Vec<Vec<f64>> {
+/// Precompute the symmetric Δt and σ_f²·exp(-Δt²/(2L²)) matrices. Both are
+/// period-independent so we build them once per call to `estimate_period`.
+fn build_dt_and_se_matrices(
+    t: &[f64],
+    hp: &QuasiPeriodicGPHyperparams,
+) -> (DMatrix<f64>, DMatrix<f64>) {
     let n = t.len();
-    let mut a = vec![vec![0.0_f64; n]; n];
-    let jitter = hp.noise_variance + 1.0e-8 * hp.signal_variance.max(1.0e-12);
+    let two_l2 = 2.0 * hp.length_scale_s * hp.length_scale_s;
+    let mut dt_mat = DMatrix::<f64>::zeros(n, n);
+    let mut se_mat = DMatrix::<f64>::zeros(n, n);
     for i in 0..n {
         for j in 0..=i {
-            let val = qp_kernel(t[i] - t[j], period, hp);
-            a[i][j] = val;
+            let dt = t[i] - t[j];
+            let se = hp.signal_variance * (-(dt * dt) / two_l2).exp();
+            dt_mat[(i, j)] = dt;
+            se_mat[(i, j)] = se;
             if i != j {
-                a[j][i] = val;
+                dt_mat[(j, i)] = dt;
+                se_mat[(j, i)] = se;
             }
         }
-        a[i][i] += jitter;
     }
-    a
+    (dt_mat, se_mat)
 }
 
-/// log p(y | K) = -½ y^T K^-1 y - ½ log|K| - N/2 log(2π).
-/// Uses Cholesky in-place; returns -∞ if K isn't positive definite.
-fn gp_log_marginal_likelihood(mut k: Vec<Vec<f64>>, y: &[f64]) -> f64 {
-    let n = k.len();
-    if cholesky_lower_in_place(&mut k).is_err() {
-        return f64::NEG_INFINITY;
-    }
-    let log_det: f64 = (0..n).map(|i| k[i][i].ln()).sum::<f64>() * 2.0;
-    let z = forward_solve_lower(&k, y);
-    let quad: f64 = z.iter().map(|x| x * x).sum();
-    -0.5 * quad - 0.5 * log_det - (n as f64) / 2.0 * (2.0 * std::f64::consts::PI).ln()
-}
+/// Build the QP Gram matrix at trial period `P` using the cached SE component
+/// and run Cholesky / log-marginal-likelihood via nalgebra. Per-trial cost is
+/// dominated by the O(N³) Cholesky; the kernel evaluation is one sin and one
+/// exp per pair (vs. two exps and a sin in the uncached path).
+fn qp_log_marginal_likelihood_cached(
+    dt_mat: &DMatrix<f64>,
+    se_mat: &DMatrix<f64>,
+    y: &DVector<f64>,
+    period: f64,
+    hp: &QuasiPeriodicGPHyperparams,
+) -> f64 {
+    let n = se_mat.nrows();
+    let lambda2 = hp.harmonic_scale * hp.harmonic_scale;
+    let jitter = hp.noise_variance + 1.0e-8 * hp.signal_variance.max(1.0e-12);
 
-/// In-place Cholesky factorization of a symmetric positive-definite matrix:
-/// overwrites the lower triangle with L such that L Lᵀ = A; upper triangle zeroed.
-fn cholesky_lower_in_place(a: &mut [Vec<f64>]) -> Result<(), &'static str> {
-    let n = a.len();
+    let mut k = DMatrix::<f64>::zeros(n, n);
     for i in 0..n {
         for j in 0..=i {
-            let mut s = a[i][j];
-            for k in 0..j {
-                s -= a[i][k] * a[j][k];
-            }
-            if i == j {
-                if s <= 0.0 {
-                    return Err("matrix is not positive definite");
-                }
-                a[i][i] = s.sqrt();
-            } else {
-                a[i][j] = s / a[j][j];
+            let dt = dt_mat[(i, j)];
+            let arg = std::f64::consts::PI * dt / period;
+            let per = (-2.0 * arg.sin().powi(2) / lambda2).exp();
+            let val = se_mat[(i, j)] * per;
+            k[(i, j)] = val;
+            if i != j {
+                k[(j, i)] = val;
             }
         }
-        for j in (i + 1)..n {
-            a[i][j] = 0.0;
-        }
+        k[(i, i)] += jitter;
     }
-    Ok(())
-}
 
-/// Forward-substitute L x = b for lower-triangular L.
-fn forward_solve_lower(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
-    let n = l.len();
-    let mut x = vec![0.0; n];
-    for i in 0..n {
-        let mut s = b[i];
-        for j in 0..i {
-            s -= l[i][j] * x[j];
-        }
-        x[i] = s / l[i][i];
-    }
-    x
+    let chol = match k.cholesky() {
+        Some(c) => c,
+        None => return f64::NEG_INFINITY,
+    };
+
+    // log|K| = 2 · Σ log L_ii
+    let log_det: f64 = chol.l().diagonal().iter().map(|x| x.ln()).sum::<f64>() * 2.0;
+
+    // y^T K^-1 y via Cholesky solve.
+    let solved = chol.solve(y);
+    let quad = y.dot(&solved);
+
+    -0.5 * quad - 0.5 * log_det - (n as f64) / 2.0 * (2.0 * std::f64::consts::PI).ln()
 }
 
 #[cfg(test)]
@@ -906,50 +1054,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cholesky_2x2() {
-        // A = [[4, 2], [2, 3]] → L = [[2, 0], [1, sqrt(2)]]
-        let mut a = vec![vec![4.0, 2.0], vec![2.0, 3.0]];
-        cholesky_lower_in_place(&mut a).unwrap();
-        assert!((a[0][0] - 2.0).abs() < 1.0e-12);
-        assert!((a[1][0] - 1.0).abs() < 1.0e-12);
-        assert!((a[1][1] - 2.0_f64.sqrt()).abs() < 1.0e-12);
-        assert_eq!(a[0][1], 0.0);
-    }
-
-    #[test]
-    fn test_cholesky_solve_3x3() {
-        // K = LLᵀ identity-like check: solve K x = b, verify K x ≈ b.
-        let k = vec![
-            vec![4.0, 2.0, 0.0],
-            vec![2.0, 5.0, 1.0],
-            vec![0.0, 1.0, 3.0],
-        ];
-        let b = vec![1.0, 2.0, 3.0];
-        let mut l = k.clone();
-        cholesky_lower_in_place(&mut l).unwrap();
-        // Solve L z = b, then Lᵀ x = z
-        let z = forward_solve_lower(&l, &b);
-        // back-substitute Lᵀ x = z manually
-        let n = 3;
-        let mut x = vec![0.0; n];
-        for i in (0..n).rev() {
-            let mut s = z[i];
-            for j in (i + 1)..n {
-                s -= l[j][i] * x[j];
-            }
-            x[i] = s / l[i][i];
-        }
-        // Verify K x ≈ b
-        for i in 0..n {
-            let mut s = 0.0;
-            for j in 0..n {
-                s += k[i][j] * x[j];
-            }
-            assert!((s - b[i]).abs() < 1.0e-10, "K x_{} = {} but b = {}", i, s, b[i]);
-        }
-    }
-
-    #[test]
     fn test_quasi_periodic_gp_sine_wave() {
         let true_period = 3600.0;
         let lightcurve = build_sine_lightcurve(true_period, 100, 12345);
@@ -959,6 +1063,7 @@ mod tests {
             1800.0,
             7200.0,
             0.01,
+            None,
             None,
             None,
             None,
@@ -1028,6 +1133,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(
@@ -1081,6 +1187,7 @@ mod tests {
             1800.0,
             7200.0,
             0.01,
+            None,
             None,
             None,
             None,

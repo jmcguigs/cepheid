@@ -1,6 +1,6 @@
 [package]
 name = "cepheid"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2024"
 description = "A Rust library for working with lightcurve data"
 license = "MIT"
@@ -13,6 +13,13 @@ categories = ["science"]
 chrono = { version = "0.4" }
 rand = "0.9.2"
 rayon = "1.10"
+nalgebra = "0.33"
 
 [dev-dependencies]
 bland = "0.2"
+lemonaid = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uuid = "1"
+reqwest = { version = "0.13", features = ["json"] }
+serde_json = "1"
+sgp4 = "2.4"

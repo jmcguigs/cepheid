@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 
 
+#[derive(Clone, Debug)]
 pub struct Observation {
     pub vismag: f64,
     pub range_m: f64,

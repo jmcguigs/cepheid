@@ -1,5 +1,6 @@
 use crate::entities::observation::Observation;
 
+#[derive(Clone, Debug)]
 pub struct Lightcurve {
     pub observations: Vec<Observation>,
     pub is_periodic: Option<bool>,  // Optional: indicates if the lightcurve is periodic
