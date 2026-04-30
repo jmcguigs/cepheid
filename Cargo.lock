@@ -18,6 +18,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "bland"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c24634ff27823ed45c6fc93e0984b3c04e3460920afd350c8437c1a6c490c282"
+
+[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -37,6 +43,7 @@ dependencies = [
 name = "cepheid"
 version = "0.2.0"
 dependencies = [
+ "bland",
  "chrono",
  "rand",
  "rayon",
