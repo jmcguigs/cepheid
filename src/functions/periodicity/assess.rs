@@ -1356,4 +1356,22 @@ mod tests {
             a.notes
         );
     }
+
+    #[test]
+    fn t20_se_aperiodic_assess_not_periodic() {
+        let n = 80;
+        let span = 4000.0;
+        let t: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64 * span).collect();
+        let y: Vec<f64> = t
+            .iter()
+            .map(|ti| (ti / span).powi(2) - 0.3 * (ti / span))
+            .collect();
+        let s = series_of(t, y, None);
+        let mut c = cfg();
+        c.scale = SearchScale::Full;
+        c.min_period_s = Some(80.0);
+        c.max_period_s = Some(800.0);
+        let a = assess_periodicity(&s, &c);
+        assert_ne!(a.decision, PeriodicityDecision::Periodic, "{:?}", a.notes);
+    }
 }

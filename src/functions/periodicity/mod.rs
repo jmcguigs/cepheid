@@ -9,10 +9,9 @@ pub use assess::assess_periodicity;
 
 use crate::entities::lightcurve::Lightcurve;
 use crate::entities::observation::Observation;
+use crate::functions::sampling::cluster_passes;
 use nalgebra::{DMatrix, DVector};
 use rand::prelude::SliceRandom;
-use rand::rngs::StdRng;
-use rand::SeedableRng;
 use rayon::prelude::*;
 
 /// Phase in `[0, 1)` for time `t_s` and period `period` (both seconds).
@@ -447,8 +446,8 @@ fn log_gamma(x: f64) -> f64 {
 ///
 /// For each trial period the other hyperparameters are fixed at sensible
 /// defaults derived from the data (override via `hyperparams`). The score
-/// is the log marginal likelihood of the QP-GP minus the same GP with no
-/// periodic component (period → ∞, leaving SE × σ_f² + noise as baseline).
+/// is the log marginal likelihood of the QP-GP minus the **SE-only** GP
+/// (period → ∞, periodic factor = 1) at the same \(L, σ_f², σ_n²\).
 /// Look-elsewhere correction subtracts log(N_trials) just like G-L.
 pub struct QuasiPeriodicGPPeriodEstimator {}
 
@@ -477,12 +476,12 @@ pub struct QuasiPeriodicGPResult {
 
 impl QuasiPeriodicGPPeriodEstimator {
     /// Run the estimator. Defaults: hyperparams derived from data
-    /// (L = span/2, λ = 1.0, σ_f² = 0.95·var(y), σ_n² = 0.05·var(y));
-    /// `log_odds_threshold` = 5.0; `max_trial_periods` = 1000 (split between a
-    /// 200-point coarse log-spaced scan and ~800 fine trials around the top-5
-    /// coarse peaks); `max_obs` = 600 (each evaluation is an O(N³) Cholesky,
-    /// so we uniform-randomly subsample down to this cap when the lightcurve
-    /// is larger).
+    /// (`L = median_pass_duration.max(3·min_period).min(span)`, λ = 1.0,
+    /// σ_n² from intra-pass consecutive-pair half-variance, σ_f² = var − σ_n²);
+    /// `log_odds_threshold` = 5.0; `max_trial_periods` = 1000 (coarse log
+    /// scan + refine around top-5 peaks); `max_obs` = 600 (pass-stratified
+    /// subsample when the lightcurve is larger). Inherent accept is still
+    /// `log_odds > 5`.
     pub fn estimate_period(
         lightcurve: &Lightcurve,
         min_period: f64,
@@ -497,10 +496,9 @@ impl QuasiPeriodicGPPeriodEstimator {
         let max_trials = max_trial_periods.unwrap_or(1000);
         let max_obs = max_obs.unwrap_or(600).max(10);
 
-        // Subsample if needed — uniform random selection seeded for reproducibility.
         let subsampled;
         let lc: &Lightcurve = if lightcurve.observations.len() > max_obs {
-            subsampled = subsample_lightcurve(lightcurve, max_obs, 0xC0FFEE_u64);
+            subsampled = subsample_lightcurve_by_pass(lightcurve, max_obs, 0xC0FFEE_u64);
             &subsampled
         } else {
             lightcurve
@@ -536,7 +534,6 @@ impl QuasiPeriodicGPPeriodEstimator {
             .iter()
             .map(|o| o.std_magnitude - mean_y)
             .collect();
-        let var_y = y_vec.iter().map(|v| v * v).sum::<f64>() / (n - 1).max(1) as f64;
 
         // Cache the dt and SE-component matrices once. Both are
         // period-independent — only the periodic factor exp(-2sin²(πΔt/P)/λ²)
@@ -544,10 +541,8 @@ impl QuasiPeriodicGPPeriodEstimator {
         let (dt_mat, se_mat) = build_dt_and_se_matrices(&t, &hp);
         let y_dvec = DVector::from_column_slice(&y_vec);
 
-        // Baseline: i.i.d. Gaussian with variance = sample variance of y. This
-        // tests "does adding QP structure beat treating the data as pure noise?"
-        // — appropriate when σ_f² may be near zero (true white noise input).
-        let log_ml_baseline = noise_only_log_marginal_likelihood(&y_vec, var_y.max(1.0e-12));
+        // Baseline: SE-only GP (periodic factor → 1) at the same hyperparameters.
+        let log_ml_baseline = se_log_marginal_likelihood(&se_mat, &y_dvec, &hp);
 
         // Coarse log-spaced scan to localize peaks cheaply, then refine adaptive
         // trials around the top-K. Each Cholesky is O(N³), so we'd rather spend
@@ -631,16 +626,35 @@ impl QuasiPeriodicGPPeriodEstimator {
     }
 }
 
-fn subsample_lightcurve(lc: &Lightcurve, n: usize, seed: u64) -> Lightcurve {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut indices: Vec<usize> = (0..lc.observations.len()).collect();
-    indices.shuffle(&mut rng);
-    indices.truncate(n);
-    let observations: Vec<Observation> = indices
-        .iter()
-        .map(|&i| lc.observations[i].clone())
-        .collect();
-    Lightcurve::new(observations, lc.is_periodic, lc.period_sec)
+fn subsample_lightcurve_by_pass(lc: &Lightcurve, max_obs: usize, _seed: u64) -> Lightcurve {
+    let sorted = lc.observations_sorted_by_time();
+    let t: Vec<f64> = sorted.iter().map(|o| o.unix_seconds()).collect();
+    let passes = cluster_passes(&t, 8.0, 60.0);
+    let n_passes = passes.len().max(1);
+    let cap = (max_obs.div_ceil(n_passes)).max(1);
+    let mut kept: Vec<Observation> = Vec::new();
+    for p in &passes {
+        let idxs: Vec<usize> = (0..sorted.len())
+            .filter(|&i| t[i] >= p.t_start_s && t[i] <= p.t_end_s)
+            .collect();
+        if idxs.is_empty() {
+            continue;
+        }
+        let take = if idxs.len() >= 3 { cap.max(3).min(idxs.len()) } else { idxs.len() };
+        if take >= idxs.len() {
+            kept.extend(idxs.iter().map(|&i| sorted[i].clone()));
+        } else {
+            for k in 0..take {
+                let j = if take == 1 {
+                    0
+                } else {
+                    k * (idxs.len() - 1) / (take - 1)
+                };
+                kept.push(sorted[idxs[j]].clone());
+            }
+        }
+    }
+    Lightcurve::new(kept, lc.is_periodic, lc.period_sec)
 }
 
 fn top_k_peaks(periodogram: &[(f64, f64)], k: usize) -> Vec<f64> {
@@ -753,7 +767,21 @@ fn default_qp_hyperparams(
     // and log-likelihood collapses. Capped at min_period below to prevent
     // L < P, which would let the SE envelope decay before periodicity has
     // a chance to manifest.
-    let length_scale_s = (3.0 * max_period_s).clamp(min_period_s, span);
+    let t: Vec<f64> = lc
+        .observations_sorted_by_time()
+        .iter()
+        .map(|o| o.unix_seconds())
+        .collect();
+    let passes = cluster_passes(&t, 8.0, 60.0);
+    let mut durs: Vec<f64> = passes.iter().map(|p| p.duration_s()).collect();
+    durs.sort_by(|a, b| a.total_cmp(b));
+    let median_pass = if durs.is_empty() {
+        span
+    } else {
+        durs[durs.len() / 2]
+    };
+    let _ = max_period_s;
+    let length_scale_s = median_pass.max(3.0 * min_period_s).min(span);
 
     QuasiPeriodicGPHyperparams {
         length_scale_s,
@@ -765,22 +793,63 @@ fn default_qp_hyperparams(
 
 fn consecutive_pair_noise_variance(lc: &Lightcurve) -> f64 {
     let sorted = lc.observations_sorted_by_time();
-    let n = sorted.len();
-    if n < 2 {
+    if sorted.len() < 2 {
         return 1.0e-12;
     }
-    let mut diffs: Vec<f64> = (0..n - 1)
-        .map(|i| (sorted[i + 1].std_magnitude - sorted[i].std_magnitude).powi(2) / 2.0)
-        .collect();
+    let t: Vec<f64> = sorted.iter().map(|o| o.unix_seconds()).collect();
+    let passes = cluster_passes(&t, 8.0, 60.0);
+    let mut diffs: Vec<f64> = Vec::new();
+    for p in &passes {
+        let pts: Vec<&Observation> = sorted
+            .iter()
+            .copied()
+            .filter(|o| {
+                let ti = o.unix_seconds();
+                ti >= p.t_start_s && ti <= p.t_end_s
+            })
+            .collect();
+        for i in 0..pts.len().saturating_sub(1) {
+            let d = pts[i + 1].std_magnitude - pts[i].std_magnitude;
+            diffs.push(d * d / 2.0);
+        }
+    }
+    if diffs.is_empty() {
+        return 1.0e-12;
+    }
     diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     diffs[diffs.len() / 2]
 }
 
+#[cfg(test)]
 fn noise_only_log_marginal_likelihood(y: &[f64], variance: f64) -> f64 {
-    // y is mean-subtracted; iid N(0, σ²).
+    // y is mean-subtracted; iid N(0, σ²). Kept for tests; not the QP decision baseline.
     let n = y.len() as f64;
     let ss: f64 = y.iter().map(|v| v * v).sum();
     -0.5 * ss / variance - 0.5 * n * (2.0 * std::f64::consts::PI * variance).ln()
+}
+
+fn se_log_marginal_likelihood(
+    se_mat: &DMatrix<f64>,
+    y: &DVector<f64>,
+    hp: &QuasiPeriodicGPHyperparams,
+) -> f64 {
+    let n = se_mat.nrows();
+    let base = hp.noise_variance + 1.0e-8 * hp.signal_variance.max(1.0e-12);
+    for scale in [1.0, 1.0e2, 1.0e4, 1.0e6] {
+        let mut k = se_mat.clone();
+        let jitter = base * scale;
+        for i in 0..n {
+            k[(i, i)] += jitter;
+        }
+        let Some(chol) = k.cholesky() else {
+            continue;
+        };
+        let log_det: f64 = chol.l().diagonal().iter().map(|x| x.ln()).sum::<f64>() * 2.0;
+        let solved = chol.solve(y);
+        let quad = y.dot(&solved);
+        return -0.5 * quad - 0.5 * log_det - (n as f64) / 2.0 * (2.0 * std::f64::consts::PI).ln();
+    }
+    f64::NEG_INFINITY
 }
 
 /// Precompute the symmetric Δt and σ_f²·exp(-Δt²/(2L²)) matrices. Both are
@@ -1333,6 +1402,40 @@ mod tests {
             "Non-periodic signal should not yield a period (log_odds = {})",
             result.log_odds
         );
+    }
+
+    #[test]
+    fn t20_se_aperiodic_inherent_qp_rejects() {
+        let num = 80;
+        let base_time = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let span = 4000.0;
+        let mut observations = Vec::new();
+        for i in 0..num {
+            let t = i as f64 / (num - 1) as f64 * span;
+            // Slow aperiodic drift — not an SE bump (which a long-L QP can still fit).
+            let y = (t / span).powi(2) - 0.3 * (t / span);
+            observations.push(Observation {
+                vismag: y,
+                range_m: 1.0e6,
+                phase_rad: 0.0,
+                std_magnitude: y,
+                timestamp: base_time + chrono::Duration::milliseconds((t * 1000.0) as i64),
+                fractional_period: None,
+            });
+        }
+        let lc = Lightcurve::new(observations, Some(false), None);
+        let result = QuasiPeriodicGPPeriodEstimator::estimate_period(
+            &lc, 80.0, 800.0, 0.02, None, None, None, None,
+        );
+        assert!(
+            result.log_odds <= 5.0,
+            "SE aperiodic data must not beat the SE null (log_odds = {})",
+            result.log_odds
+        );
+        assert!(result.period_s.is_none());
+        let _ = noise_only_log_marginal_likelihood(&[0.0, 0.1], 1.0);
     }
 
     #[test]
