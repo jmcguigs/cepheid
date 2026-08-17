@@ -1,7 +1,7 @@
 //! Pulls real optical observations from the Citra Space API for two satellites
 //! and runs all three period estimators on each:
 //!
-//!   - NORAD 67689 — stable LEO       (no period expected; estimators should reject)
+//!   - NORAD 67689 — stable LEO       (no period expected; assess should reject)
 //!   - NORAD 22927 — tumbling GEO     (period expected; tumbler-style double peak)
 //!
 //! Set `CITRA_PAT` to a Citra personal access token, then:
@@ -10,7 +10,7 @@
 //!
 //! For each satellite the example writes:
 //!     <prefix>_raw.svg                       (magnitude vs. time)
-//!     <prefix>_folded_string_length.svg      (only if string-length detects)
+//!     <prefix>_folded_assess.svg             (only if assess_periodicity is Periodic)
 //!     <prefix>_folded_gregory_loredo.svg     (only if G-L detects)
 //!     <prefix>_folded_qp_gp.svg              (only if QP-GP detects)
 //!
@@ -22,8 +22,10 @@
 use bland::{Figure, Marker, PaperSize};
 use cepheid::entities::lightcurve::Lightcurve;
 use cepheid::entities::observation::Observation;
+use cepheid::assess_periodicity;
+use cepheid::entities::assessment::{PeriodSearchConfig, PeriodicityDecision};
 use cepheid::functions::periodicity::{
-    GregoryLoredoPeriodEstimator, QuasiPeriodicGPPeriodEstimator, StringLengthPeriodEstimator,
+    GregoryLoredoPeriodEstimator, QuasiPeriodicGPPeriodEstimator,
 };
 use chrono::{DateTime, Duration, Utc};
 use lemonaid::types::CitraElsetType;
@@ -141,14 +143,15 @@ async fn analyze(
     }
     println!("  searching periods {:.1}–{:.1} s", MIN_PERIOD_S, max_p);
 
-    let sl_period = StringLengthPeriodEstimator::estimate_period(
-        &lc,
-        MIN_PERIOD_S,
-        max_p,
-        0.005,
-        None,
+    let series = lc.to_series().expect("series");
+    let mut cfg = PeriodSearchConfig::conservative();
+    cfg.min_period_s = Some(MIN_PERIOD_S);
+    cfg.max_period_s = Some(max_p);
+    let assess = assess_periodicity(&series, &cfg);
+    println!(
+        "    assess_periodicity    : {:?} P={:?} FAP={:?}",
+        assess.decision, assess.period_s, assess.fap
     );
-    println!("    string length         : {:?}", sl_period);
 
     let gl = GregoryLoredoPeriodEstimator::estimate_period(
         &lc,
@@ -184,14 +187,16 @@ async fn analyze(
         target.label,
         &lc,
     );
-    if let Some(p) = sl_period {
-        save_folded_plot(
-            &format!("{}_folded_string_length.svg", target.file_prefix),
-            target.label,
-            "string length",
-            p,
-            &lc,
-        );
+    if assess.decision == PeriodicityDecision::Periodic {
+        if let Some(p) = assess.period_s {
+            save_folded_plot(
+                &format!("{}_folded_assess.svg", target.file_prefix),
+                target.label,
+                "assess_periodicity",
+                p,
+                &lc,
+            );
+        }
     }
     if let Some(p) = gl.period_s {
         save_folded_plot(

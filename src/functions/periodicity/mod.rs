@@ -12,6 +12,8 @@ use crate::entities::observation::Observation;
 use crate::functions::sampling::cluster_passes;
 use nalgebra::{DMatrix, DVector};
 use rand::prelude::SliceRandom;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use rayon::prelude::*;
 
 /// Phase in `[0, 1)` for time `t_s` and period `period` (both seconds).
@@ -85,60 +87,46 @@ fn log_spaced_grid(min_period: f64, max_period: f64, n: usize) -> Vec<f64> {
 pub struct StringLengthPeriodEstimator {}
 
 impl StringLengthPeriodEstimator {
-    fn compute_string_length(lightcurve: &Lightcurve, period: f64) -> f64 {
-        // phase fold observations by period
-        let mut folded_obs: Vec<(&Observation, f64)> = lightcurve
-            .observations
+    fn robust_sigma(mags: &[f64]) -> f64 {
+        if mags.is_empty() {
+            return 1.0;
+        }
+        let mut v = mags.to_vec();
+        v.sort_by(|a, b| a.total_cmp(b));
+        let med = v[v.len() / 2];
+        let mut dev: Vec<f64> = v.iter().map(|m| (m - med).abs()).collect();
+        dev.sort_by(|a, b| a.total_cmp(b));
+        (1.4826 * dev[dev.len() / 2]).max(1.0e-6)
+    }
+
+    fn string_length(times: &[f64], mags: &[f64], period: f64, sigma: f64) -> f64 {
+        let mut folded: Vec<(f64, f64)> = times
             .iter()
-            .map(|obs| {
-                let phase = fold_phase(obs.unix_seconds(), period);
-                (obs, phase)
-            })
+            .zip(mags.iter())
+            .map(|(&t, &m)| (fold_phase(t, period), m))
             .collect();
-        // sort by phase
-        folded_obs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        // compute string length - handle wrap-around
-        let mut string_length = 0.0;
-        for i in 0..folded_obs.len() {
-            let (obs_a, phase_a) = folded_obs[i];
-            let (obs_b, phase_b) = folded_obs[(i + 1) % folded_obs.len()];
-            let delta_phase = if i == folded_obs.len() - 1 {
-                // wrap-around case
-                (phase_b + 1.0) - phase_a
-            } else {
-                phase_b - phase_a
-            };
-            let delta_mag = obs_b.std_magnitude - obs_a.std_magnitude;
-            string_length += (delta_phase.powi(2) + delta_mag.powi(2)).sqrt();
+        folded.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let n = folded.len();
+        if n == 0 {
+            return f64::INFINITY;
         }
-        string_length
+        let mut len = 0.0;
+        for i in 0..n {
+            let (pa, ma) = folded[i];
+            let (pb, mb) = folded[(i + 1) % n];
+            let dphi = if i + 1 == n { pb + 1.0 - pa } else { pb - pa };
+            let dmag = (mb - ma) / sigma;
+            len += (dphi * dphi + dmag * dmag).sqrt();
+        }
+        len
     }
 
-    fn compute_prior_string_length(lightcurve: &Lightcurve) -> f64 {
-        // compute string length using random ordering of observations (baseline to compare against)
-        // randomize ordering
-        let mut prior_obs: Vec<&Observation> = lightcurve.observations.iter().collect();
-
-        let mut rng = rand::rng();
-        prior_obs.shuffle(&mut rng);
-        let mut string_length = 0.0;
-        for i in 0..prior_obs.len() {
-            let obs_a = prior_obs[i];
-            let obs_b = prior_obs[(i + 1) % prior_obs.len()];
-            let delta_phase = 1.0 / prior_obs.len() as f64; // uniform spacing in prior
-            let delta_mag = obs_b.std_magnitude - obs_a.std_magnitude;
-            string_length += (delta_phase.powi(2) + delta_mag.powi(2)).sqrt();
-        }
-        string_length
-    }
-
-    pub fn estimate_period(
+    fn score_grid(
         lightcurve: &Lightcurve,
         min_period: f64,
         max_period: f64,
         max_fractional_error: f64,
-        threshold_odds_ratio: Option<f64>,
-    ) -> Option<f64> {
+    ) -> Vec<(f64, f64, f64)> {
         let trials = trial_periods(
             lightcurve,
             min_period,
@@ -147,42 +135,98 @@ impl StringLengthPeriodEstimator {
             5000,
         );
         if trials.is_empty() {
-            return None;
+            return Vec::new();
         }
-        let prior_string_length = Self::compute_prior_string_length(lightcurve);
-
-        let mut scores: Vec<(f64, f64)> = trials
+        let times: Vec<f64> = lightcurve
+            .observations
+            .iter()
+            .map(|o| o.unix_seconds())
+            .collect();
+        let mags: Vec<f64> = lightcurve
+            .observations
+            .iter()
+            .map(|o| o.std_magnitude)
+            .collect();
+        let sigma = Self::robust_sigma(&mags);
+        let mut prior_mags = mags.clone();
+        let mut rng = StdRng::seed_from_u64(0x00C0_FFEE);
+        prior_mags.shuffle(&mut rng);
+        let mut scores: Vec<(f64, f64, f64)> = trials
             .par_iter()
-            .map(|&period| (period, Self::compute_string_length(lightcurve, period)))
+            .map(|&period| {
+                let l = Self::string_length(&times, &mags, period, sigma);
+                let l0 = Self::string_length(&times, &prior_mags, period, sigma);
+                (period, l, l0)
+            })
             .collect();
         scores.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scores
+    }
 
-        let (best_idx, &(best_period, best_string_length)) = scores
+    /// Returns `(period, string_length, prior_string_length)` for each trial.
+    pub fn estimate_period_with_periodogram(
+        lightcurve: &Lightcurve,
+        min_period: f64,
+        max_period: f64,
+        max_fractional_error: f64,
+        threshold_odds_ratio: Option<f64>,
+    ) -> (Option<f64>, Vec<(f64, f64)>) {
+        let scores = Self::score_grid(
+            lightcurve,
+            min_period,
+            max_period,
+            max_fractional_error,
+        );
+        if scores.is_empty() {
+            return (None, Vec::new());
+        }
+        let periodogram: Vec<(f64, f64)> = scores.iter().map(|&(p, l, _)| (p, l)).collect();
+        let (best_idx, _) = scores
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| a.1.total_cmp(&b.1))
             .unwrap();
-
-        // Bound-snap: do not report a search endpoint unless it is a true
-        // interior local minimum (both neighbours worse). Stops P_min = 3 s
-        // from winning on signal-free or poorly-resolved folds.
+        let (best_period, best_l, prior_l) = scores[best_idx];
         if is_bound_snap(best_period, min_period, max_period)
-            && !is_interior_minimum(&scores, best_idx)
+            && !is_interior_minimum(
+                &scores.iter().map(|&(p, l, _)| (p, l)).collect::<Vec<_>>(),
+                best_idx,
+            )
         {
-            return None;
+            return (None, periodogram);
         }
-
-        // Only return a period if it's significantly better than the prior
         let improvement_threshold = if let Some(ratio) = threshold_odds_ratio {
             1.0 / ratio
         } else {
-            0.2 // default threshold: 80% improvement
+            0.2
         };
-        if best_string_length < prior_string_length * improvement_threshold {
+        let period = if best_l < prior_l * improvement_threshold {
             Some(best_period)
         } else {
             None
-        }
+        };
+        (period, periodogram)
+    }
+
+    #[deprecated(
+        since = "0.5.1",
+        note = "use assess_periodicity (GLS+PDM). String length is sampling-biased."
+    )]
+    pub fn estimate_period(
+        lightcurve: &Lightcurve,
+        min_period: f64,
+        max_period: f64,
+        max_fractional_error: f64,
+        threshold_odds_ratio: Option<f64>,
+    ) -> Option<f64> {
+        Self::estimate_period_with_periodogram(
+            lightcurve,
+            min_period,
+            max_period,
+            max_fractional_error,
+            threshold_odds_ratio,
+        )
+        .0
     }
 }
 
@@ -923,6 +967,7 @@ fn qp_log_marginal_likelihood_cached(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};

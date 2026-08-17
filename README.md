@@ -1,3 +1,6 @@
 # Cepheid
 
-`cepheid` is a Rust library for analyzing photmetric data. It provides functions for normalizing visual magnitude data to a standard range and phase as well as estimating the period of a lightcurve.
+`cepheid` is a Rust library for analyzing lightcurve data (optical photometry
+and, after ingest, RF power). The product period API is
+`assess_periodicity` (generalized Lomb–Scargle + PDM, with a stable-satellite
+null). Range/phase normalization for visual magnitudes is also included.
