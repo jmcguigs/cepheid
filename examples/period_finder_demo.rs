@@ -1,6 +1,5 @@
-//! Run all three period estimators on a randomly-sampled noisy periodic signal
-//! and produce SVG plots of the raw lightcurve plus phase-folded curves at the
-//! period each estimator recovers.
+//! Run `assess_periodicity` (GLS+PDM) plus the optional G-L / QP-GP
+//! research estimators on a randomly-sampled noisy periodic signal.
 //!
 //! Run with:
 //!     cargo run --release --example period_finder_demo
@@ -14,8 +13,10 @@
 use bland::{Figure, Marker, PaperSize};
 use cepheid::entities::lightcurve::Lightcurve;
 use cepheid::entities::observation::Observation;
+use cepheid::assess_periodicity;
+use cepheid::entities::assessment::{PeriodSearchConfig, PeriodicityDecision, SearchScale};
 use cepheid::functions::periodicity::{
-    GregoryLoredoPeriodEstimator, QuasiPeriodicGPPeriodEstimator, StringLengthPeriodEstimator,
+    GregoryLoredoPeriodEstimator, QuasiPeriodicGPPeriodEstimator,
 };
 use chrono::{DateTime, Utc};
 use rand::rngs::StdRng;
@@ -58,15 +59,21 @@ fn main() {
 
     let min_p = 20.0;
     let max_p = 100.0;
-    let max_frac_err = 0.005;
+    let max_frac_err = 0.005; // used by optional G-L / QP-GP
 
     println!("True period: {:.4} s", true_period);
     println!("Samples: {}, span: {:.1} s\n", num_samples, span);
 
-    let sl_period = StringLengthPeriodEstimator::estimate_period(
-        &lightcurve, min_p, max_p, max_frac_err, None,
+    let series = lightcurve.to_series().expect("series");
+    let mut cfg = PeriodSearchConfig::conservative();
+    cfg.min_period_s = Some(min_p);
+    cfg.max_period_s = Some(max_p);
+    cfg.scale = SearchScale::Full;
+    let assess = assess_periodicity(&series, &cfg);
+    println!(
+        "assess_periodicity    : {:?} P={:?} FAP={:?}",
+        assess.decision, assess.period_s, assess.fap
     );
-    println!("String length         : {:?}", sl_period);
 
     let gl = GregoryLoredoPeriodEstimator::estimate_period(
         &lightcurve, min_p, max_p, max_frac_err, None, None, None,
@@ -86,12 +93,16 @@ fn main() {
 
     save_raw_plot("lightcurve_raw.svg", &lightcurve);
 
-    save_folded_plot(
-        "lightcurve_folded_string_length.svg",
-        "String length",
-        sl_period.unwrap_or(true_period),
-        &lightcurve,
-    );
+    if assess.decision == PeriodicityDecision::Periodic {
+        if let Some(p) = assess.period_s {
+            save_folded_plot(
+                "lightcurve_folded_assess.svg",
+                "assess_periodicity (GLS+PDM)",
+                p,
+                &lightcurve,
+            );
+        }
+    }
     save_folded_plot(
         "lightcurve_folded_gregory_loredo.svg",
         "Gregory-Loredo (variable-m)",

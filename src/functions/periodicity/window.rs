@@ -12,7 +12,6 @@
 //! \(W(0) = 1\). Peaks of \(W\) are sampling lines (pass cadence, 1 day, …).
 
 use crate::entities::assessment::{Periodogram, ScoreKind};
-use crate::functions::periodicity::gls::floating_mean_gls_power;
 use rayon::prelude::*;
 
 /// Sampling window \(W(f)\) at the given frequencies (Hz).
@@ -94,6 +93,7 @@ pub fn local_maxima(period_s: &[f64], score: &[f64], min_power: f64) -> Vec<(f64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::functions::periodicity::gls::floating_mean_gls_power;
 
     #[test]
     fn w_at_zero_is_one() {
