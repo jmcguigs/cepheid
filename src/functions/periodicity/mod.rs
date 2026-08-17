@@ -1,3 +1,5 @@
+pub mod window;
+
 use crate::entities::lightcurve::Lightcurve;
 use crate::entities::observation::Observation;
 use nalgebra::{DMatrix, DVector};
@@ -6,13 +8,6 @@ use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
 
-/// Generate a trial-period grid bounded by `max_trials`.
-///
-/// Uses the adaptive step Δp = p² · frac / span when the resulting count
-/// fits in `max_trials`, otherwise falls back to a log-spaced grid of
-/// exactly `max_trials` points. Photometric campaigns can span days while
-/// resolving periods in seconds — the adaptive formula collapses the step
-/// size in that regime and would generate millions of trials.
 /// Phase in `[0, 1)` for time `t_s` and period `period` (both seconds).
 ///
 /// Uses `rem_euclid` so negative timestamps fold correctly. Returns `NaN`
@@ -24,6 +19,13 @@ pub fn fold_phase(t_s: f64, period: f64) -> f64 {
     t_s.rem_euclid(period) / period
 }
 
+/// Generate a trial-period grid bounded by `max_trials`.
+///
+/// Uses the adaptive step Δp = p² · frac / span when the resulting count
+/// fits in `max_trials`, otherwise falls back to a log-spaced grid of
+/// exactly `max_trials` points. Photometric campaigns can span days while
+/// resolving periods in seconds — the adaptive formula collapses the step
+/// size in that regime and would generate millions of trials.
 pub fn trial_periods(
     lightcurve: &Lightcurve,
     min_period: f64,
