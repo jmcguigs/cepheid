@@ -1,5 +1,5 @@
-use crate::entities::observation::Observation;
 use crate::entities::lightcurve::Lightcurve;
+use crate::entities::observation::Observation;
 use nalgebra::{DMatrix, DVector};
 use rand::SeedableRng;
 use rand::prelude::SliceRandom;
@@ -13,6 +13,17 @@ use rayon::prelude::*;
 /// exactly `max_trials` points. Photometric campaigns can span days while
 /// resolving periods in seconds — the adaptive formula collapses the step
 /// size in that regime and would generate millions of trials.
+/// Phase in `[0, 1)` for time `t_s` and period `period` (both seconds).
+///
+/// Uses `rem_euclid` so negative timestamps fold correctly. Returns `NaN`
+/// if `period` is non-finite or not strictly positive.
+pub fn fold_phase(t_s: f64, period: f64) -> f64 {
+    if !period.is_finite() || period <= 0.0 {
+        return f64::NAN;
+    }
+    t_s.rem_euclid(period) / period
+}
+
 pub fn trial_periods(
     lightcurve: &Lightcurve,
     min_period: f64,
@@ -20,7 +31,13 @@ pub fn trial_periods(
     max_fractional_error: f64,
     max_trials: usize,
 ) -> Vec<f64> {
-    let span_s = lightcurve.data_span_s().max(1.0);
+    if lightcurve.observation_count() < 2 {
+        return Vec::new();
+    }
+    let span_s = lightcurve.data_span_s();
+    if span_s <= 0.0 {
+        return Vec::new();
+    }
 
     let estimated = if min_period > 0.0 {
         span_s / max_fractional_error * (1.0 / min_period - 1.0 / max_period)
@@ -59,14 +76,14 @@ fn log_spaced_grid(min_period: f64, max_period: f64, n: usize) -> Vec<f64> {
 
 pub struct StringLengthPeriodEstimator {}
 
-
 impl StringLengthPeriodEstimator {
     fn compute_string_length(lightcurve: &Lightcurve, period: f64) -> f64 {
         // phase fold observations by period
-        let mut folded_obs: Vec<(&Observation, f64)> = lightcurve.observations.iter()
+        let mut folded_obs: Vec<(&Observation, f64)> = lightcurve
+            .observations
+            .iter()
             .map(|obs| {
-                let timestamp_unix = obs.timestamp.timestamp() as f64;
-                let phase = (timestamp_unix % period) / period;
+                let phase = fold_phase(obs.unix_seconds(), period);
                 (obs, phase)
             })
             .collect();
@@ -107,18 +124,45 @@ impl StringLengthPeriodEstimator {
         string_length
     }
 
-    pub fn estimate_period(lightcurve: &Lightcurve, min_period: f64, max_period: f64, max_fractional_error: f64, threshold_odds_ratio: Option<f64>) -> Option<f64> {
-        let trials = trial_periods(lightcurve, min_period, max_period, max_fractional_error, 5000);
+    pub fn estimate_period(
+        lightcurve: &Lightcurve,
+        min_period: f64,
+        max_period: f64,
+        max_fractional_error: f64,
+        threshold_odds_ratio: Option<f64>,
+    ) -> Option<f64> {
+        let trials = trial_periods(
+            lightcurve,
+            min_period,
+            max_period,
+            max_fractional_error,
+            5000,
+        );
+        if trials.is_empty() {
+            return None;
+        }
         let prior_string_length = Self::compute_prior_string_length(lightcurve);
 
-        let (best_period, best_string_length) = trials
+        let mut scores: Vec<(f64, f64)> = trials
             .par_iter()
             .map(|&period| (period, Self::compute_string_length(lightcurve, period)))
-            .reduce(
-                || (f64::NAN, f64::MAX),
-                |(bp, bl), (p, l)| if l < bl { (p, l) } else { (bp, bl) },
-            );
-        let best_period = if best_string_length == f64::MAX { None } else { Some(best_period) };
+            .collect();
+        scores.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let (best_idx, &(best_period, best_string_length)) = scores
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.1.total_cmp(&b.1))
+            .unwrap();
+
+        // Bound-snap: do not report a search endpoint unless it is a true
+        // interior local minimum (both neighbours worse). Stops P_min = 3 s
+        // from winning on signal-free or poorly-resolved folds.
+        if is_bound_snap(best_period, min_period, max_period)
+            && !is_interior_minimum(&scores, best_idx)
+        {
+            return None;
+        }
 
         // Only return a period if it's significantly better than the prior
         let improvement_threshold = if let Some(ratio) = threshold_odds_ratio {
@@ -127,11 +171,25 @@ impl StringLengthPeriodEstimator {
             0.2 // default threshold: 80% improvement
         };
         if best_string_length < prior_string_length * improvement_threshold {
-            best_period
+            Some(best_period)
         } else {
             None
         }
     }
+}
+
+/// Geometric bound-snap window: within 3% of either search edge.
+fn is_bound_snap(period: f64, min_period: f64, max_period: f64) -> bool {
+    period <= min_period * 1.03 || period >= max_period * 0.97
+}
+
+/// Local minimum of a lower-better score. Endpoints are never interior.
+fn is_interior_minimum(scores: &[(f64, f64)], idx: usize) -> bool {
+    if idx == 0 || idx + 1 >= scores.len() {
+        return false;
+    }
+    let l = scores[idx].1;
+    l < scores[idx - 1].1 && l < scores[idx + 1].1
 }
 
 /// Bayesian binned-phase periodogram (Gregory & Loredo 1992, ApJ 398, 146).
@@ -188,10 +246,20 @@ impl GregoryLoredoPeriodEstimator {
             };
         }
 
-        let mags: Vec<f64> = lightcurve.observations.iter().map(|o| o.std_magnitude).collect();
+        let mags: Vec<f64> = lightcurve
+            .observations
+            .iter()
+            .map(|o| o.std_magnitude)
+            .collect();
         let log_z0 = constant_model_log_z(&mags);
 
-        let trials = trial_periods(lightcurve, min_period, max_period, max_fractional_error, max_trials);
+        let trials = trial_periods(
+            lightcurve,
+            min_period,
+            max_period,
+            max_fractional_error,
+            max_trials,
+        );
 
         // Look-elsewhere correction: a log-uniform prior over the period grid
         // gives each trial weight ~1/N_trials, so the per-trial log Bayes factor
@@ -218,7 +286,11 @@ impl GregoryLoredoPeriodEstimator {
             || (f64::NAN, f64::NEG_INFINITY),
             |(bp, bl), (p, l)| if l > bl { (p, l) } else { (bp, bl) },
         );
-        let best_period = if best_log_odds == f64::NEG_INFINITY { None } else { Some(best_period) };
+        let best_period = if best_log_odds == f64::NEG_INFINITY {
+            None
+        } else {
+            Some(best_period)
+        };
 
         let period = if best_period.is_some() && best_log_odds > log_odds_threshold {
             best_period
@@ -257,11 +329,7 @@ fn binned_log_z(lightcurve: &Lightcurve, period: f64, bins: usize) -> f64 {
     let mut bin_data: Vec<Vec<f64>> = (0..bins).map(|_| Vec::new()).collect();
 
     for o in &lightcurve.observations {
-        let t = o.unix_seconds();
-        let mut phase = (t % period) / period;
-        if phase < 0.0 {
-            phase += 1.0;
-        }
+        let phase = fold_phase(o.unix_seconds(), period);
         let idx = ((phase * bins as f64) as usize).min(bins - 1);
         bin_data[idx].push(o.std_magnitude);
     }
@@ -301,8 +369,7 @@ fn safe_ln(x: f64) -> f64 {
 /// Lanczos approximation to log Γ(x); reflection for x < 0.5.
 fn log_gamma(x: f64) -> f64 {
     if x < 0.5 {
-        return (std::f64::consts::PI / (std::f64::consts::PI * x).sin()).ln()
-            - log_gamma(1.0 - x);
+        return (std::f64::consts::PI / (std::f64::consts::PI * x).sin()).ln() - log_gamma(1.0 - x);
     }
     const G: f64 = 7.0;
     const COEF: [f64; 9] = [
@@ -402,8 +469,7 @@ impl QuasiPeriodicGPPeriodEstimator {
         };
 
         let n = lc.observations.len();
-        let hp =
-            hyperparams.unwrap_or_else(|| default_qp_hyperparams(lc, min_period, max_period));
+        let hp = hyperparams.unwrap_or_else(|| default_qp_hyperparams(lc, min_period, max_period));
 
         if n < 10 {
             return QuasiPeriodicGPResult {
@@ -426,8 +492,7 @@ impl QuasiPeriodicGPPeriodEstimator {
             .iter()
             .map(|o| o.unix_seconds() - t0)
             .collect();
-        let mean_y: f64 =
-            lc.observations.iter().map(|o| o.std_magnitude).sum::<f64>() / n as f64;
+        let mean_y: f64 = lc.observations.iter().map(|o| o.std_magnitude).sum::<f64>() / n as f64;
         let y_vec: Vec<f64> = lc
             .observations
             .iter()
@@ -456,7 +521,8 @@ impl QuasiPeriodicGPPeriodEstimator {
             trials
                 .par_iter()
                 .map(|&p| {
-                    let log_ml = qp_log_marginal_likelihood_cached(&dt_mat, &se_mat, &y_dvec, p, &hp);
+                    let log_ml =
+                        qp_log_marginal_likelihood_cached(&dt_mat, &se_mat, &y_dvec, p, &hp);
                     (p, log_ml - log_ml_baseline)
                 })
                 .collect()
@@ -477,7 +543,16 @@ impl QuasiPeriodicGPPeriodEstimator {
         };
         let fine_trials: Vec<f64> = peaks
             .iter()
-            .flat_map(|&peak| refine_around(peak, max_fractional_error, span_s, fine_per_peak, min_period, max_period))
+            .flat_map(|&peak| {
+                refine_around(
+                    peak,
+                    max_fractional_error,
+                    span_s,
+                    fine_per_peak,
+                    min_period,
+                    max_period,
+                )
+            })
             .collect();
         let fine_pgram = evaluate(&fine_trials);
 
@@ -523,8 +598,10 @@ fn subsample_lightcurve(lc: &Lightcurve, n: usize, seed: u64) -> Lightcurve {
     let mut indices: Vec<usize> = (0..lc.observations.len()).collect();
     indices.shuffle(&mut rng);
     indices.truncate(n);
-    let observations: Vec<Observation> =
-        indices.iter().map(|&i| lc.observations[i].clone()).collect();
+    let observations: Vec<Observation> = indices
+        .iter()
+        .map(|&i| lc.observations[i].clone())
+        .collect();
     Lightcurve::new(observations, lc.is_periodic, lc.period_sec)
 }
 
@@ -609,7 +686,11 @@ fn default_qp_hyperparams(
 ) -> QuasiPeriodicGPHyperparams {
     let n = lc.observations.len();
     let mags: Vec<f64> = lc.observations.iter().map(|o| o.std_magnitude).collect();
-    let mean = if n == 0 { 0.0 } else { mags.iter().sum::<f64>() / n as f64 };
+    let mean = if n == 0 {
+        0.0
+    } else {
+        mags.iter().sum::<f64>() / n as f64
+    };
     let var = if n > 1 {
         mags.iter().map(|m| (m - mean).powi(2)).sum::<f64>() / (n - 1) as f64
     } else {
@@ -794,10 +875,13 @@ mod tests {
             min_period,
             max_period,
             max_fractional_error,
-            Some(4.0)
+            Some(4.0),
         );
 
-        assert!(estimated_period.is_some(), "Period estimation should return a value");
+        assert!(
+            estimated_period.is_some(),
+            "Period estimation should return a value"
+        );
         let estimated = estimated_period.unwrap();
 
         // Check that estimated period is within 5% of true period
@@ -856,7 +940,7 @@ mod tests {
             min_period,
             max_period,
             max_fractional_error,
-            Some(4.0)
+            Some(4.0),
         );
 
         // For non-periodic data, the estimator should return None
@@ -882,7 +966,8 @@ mod tests {
             lcg_state = (lcg_state.wrapping_mul(1103515245).wrapping_add(12345)) % (1 << 31);
             let random_fraction = lcg_state as f64 / (1u64 << 31) as f64;
             let time_offset_sec = random_fraction * time_span;
-            let timestamp = base_time + chrono::Duration::milliseconds((time_offset_sec * 1000.0) as i64);
+            let timestamp =
+                base_time + chrono::Duration::milliseconds((time_offset_sec * 1000.0) as i64);
             let phase = 2.0 * std::f64::consts::PI * time_offset_sec / true_period;
             let magnitude = mean_magnitude + amplitude * phase.sin();
             observations.push(Observation {
@@ -926,7 +1011,10 @@ mod tests {
             true_period,
             relative_error * 100.0
         );
-        assert!(!result.periodogram.is_empty(), "periodogram must be populated");
+        assert!(
+            !result.periodogram.is_empty(),
+            "periodogram must be populated"
+        );
     }
 
     #[test]
@@ -941,7 +1029,8 @@ mod tests {
         let mut lcg_state: u64 = 54321;
         for i in 0..num_samples {
             let time_offset_sec = (i as f64 / num_samples as f64) * time_span;
-            let timestamp = base_time + chrono::Duration::milliseconds((time_offset_sec * 1000.0) as i64);
+            let timestamp =
+                base_time + chrono::Duration::milliseconds((time_offset_sec * 1000.0) as i64);
             lcg_state = (lcg_state.wrapping_mul(1103515245).wrapping_add(12345)) % (1 << 31);
             let magnitude = 8.0 + 4.0 * (lcg_state as f64 / (1u64 << 31) as f64);
             observations.push(Observation {
@@ -994,8 +1083,12 @@ mod tests {
             let phi = (t / true_period).fract();
             let g = |center: f64, amp: f64| {
                 let mut d = phi - center;
-                if d > 0.5 { d -= 1.0; }
-                if d < -0.5 { d += 1.0; }
+                if d > 0.5 {
+                    d -= 1.0;
+                }
+                if d < -0.5 {
+                    d += 1.0;
+                }
                 -amp * (-d * d / (2.0 * 0.04 * 0.04)).exp()
             };
             let magnitude = 12.0 + g(0.20, 3.0) + g(0.70, 1.5);
@@ -1020,7 +1113,10 @@ mod tests {
             None,
         );
 
-        assert!(result.period_s.is_some(), "double-peaked tumbler should be detected");
+        assert!(
+            result.period_s.is_some(),
+            "double-peaked tumbler should be detected"
+        );
         let estimated = result.period_s.unwrap();
         let rel_err_full = (estimated - true_period).abs() / true_period;
         let rel_err_half = (estimated - true_period / 2.0).abs() / (true_period / 2.0);
@@ -1168,7 +1264,8 @@ mod tests {
         let mut lcg_state: u64 = 54321;
         for i in 0..num_samples {
             let time_offset_sec = (i as f64 / num_samples as f64) * time_span;
-            let timestamp = base_time + chrono::Duration::milliseconds((time_offset_sec * 1000.0) as i64);
+            let timestamp =
+                base_time + chrono::Duration::milliseconds((time_offset_sec * 1000.0) as i64);
             lcg_state = (lcg_state.wrapping_mul(1103515245).wrapping_add(12345)) % (1 << 31);
             let magnitude = 8.0 + 4.0 * (lcg_state as f64 / (1u64 << 31) as f64);
             observations.push(Observation {
@@ -1198,5 +1295,77 @@ mod tests {
             "Non-periodic signal should not yield a period (log_odds = {})",
             result.log_odds
         );
+    }
+
+    #[test]
+    fn fold_phase_uses_rem_euclid() {
+        assert!((fold_phase(7.5, 5.0) - 0.5).abs() < 1e-12);
+        assert!((fold_phase(-2.5, 5.0) - 0.5).abs() < 1e-12);
+        assert!((fold_phase(0.0, 5.0)).abs() < 1e-12);
+        assert!(fold_phase(1.0, 0.0).is_nan());
+        assert!(fold_phase(1.0, -4.0).is_nan());
+    }
+
+    #[test]
+    fn trial_periods_empty_or_singleton_is_empty() {
+        let empty = Lightcurve::new(vec![], None, None);
+        assert!(trial_periods(&empty, 3.0, 3000.0, 0.005, 5000).is_empty());
+        let one = Lightcurve::new(
+            vec![Observation {
+                vismag: 10.0,
+                range_m: 1.0e6,
+                phase_rad: 0.0,
+                std_magnitude: 10.0,
+                timestamp: DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                fractional_period: None,
+            }],
+            None,
+            None,
+        );
+        assert!(trial_periods(&one, 3.0, 3000.0, 0.005, 5000).is_empty());
+    }
+
+    #[test]
+    fn test_t13_string_length_no_bound_snap_on_signal_free() {
+        // Signal-free, Citra-like search floor. After the unix_seconds fold
+        // fix, P_min must not be reported just because it is the grid edge.
+        let num_samples = 80;
+        let base_time = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let time_span = 86_400.0;
+        let mut observations = Vec::new();
+        let mut lcg_state: u64 = 424242;
+        for i in 0..num_samples {
+            let t = (i as f64 / num_samples as f64) * time_span;
+            lcg_state = (lcg_state.wrapping_mul(1103515245).wrapping_add(12345)) % (1 << 31);
+            let magnitude = 8.0 + 4.0 * (lcg_state as f64 / (1u64 << 31) as f64);
+            observations.push(Observation {
+                vismag: magnitude,
+                range_m: 1000.0e3,
+                phase_rad: 0.0,
+                std_magnitude: magnitude,
+                timestamp: base_time + chrono::Duration::milliseconds((t * 1000.0) as i64),
+                fractional_period: None,
+            });
+        }
+        let lightcurve = Lightcurve::new(observations, Some(false), None);
+        let min_period = 3.0;
+        let max_period = 3000.0;
+        let estimated = StringLengthPeriodEstimator::estimate_period(
+            &lightcurve,
+            min_period,
+            max_period,
+            0.005,
+            None,
+        );
+        if let Some(p) = estimated {
+            assert!(
+                p > min_period * 1.03 && p < max_period * 0.97,
+                "T13: must not report a search endpoint; got {p}"
+            );
+        }
     }
 }
