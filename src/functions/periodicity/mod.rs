@@ -2,6 +2,7 @@ pub mod assess;
 pub mod detrend;
 pub mod fap;
 pub mod gls;
+pub mod pdm;
 pub mod window;
 
 pub use assess::assess_periodicity;

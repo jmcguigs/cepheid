@@ -1,8 +1,8 @@
 //! Pass-aware `assess_periodicity`.
 
 use crate::entities::assessment::{
-    Alias, AliasKind, DetrendMode, FapMode, MethodId, PeriodSearchConfig, PeriodicityAssessment,
-    PeriodicityDecision, QualityFlags, ScoreKind, SearchScale,
+    Alias, AliasKind, Confirmation, DetrendMode, FapMode, MethodId, PeriodSearchConfig,
+    PeriodicityAssessment, PeriodicityDecision, QualityFlags, ScoreKind, SearchScale,
 };
 use crate::entities::series::{Modality, Series};
 use crate::functions::periodicity::detrend::{auto_detrend, pass_index_lists};
@@ -12,6 +12,9 @@ use crate::functions::periodicity::fap::{
 use crate::functions::periodicity::gls::{
     argmax, coarse_refine_periods, gls_periodogram, gls_power_zero_mean, interpolate_peak,
     is_interior_maximum, subtract_h1,
+};
+use crate::functions::periodicity::pdm::{
+    argmin_finite, pdm_bin_count, pdm_periodogram, pdm_theta,
 };
 use crate::functions::periodicity::window::spectral_window;
 use crate::functions::sampling::{
@@ -24,7 +27,7 @@ use rand::SeedableRng;
 const BALUEV_SKIP: f64 = 0.05;
 const CONSENSUS_REL: f64 = 0.05;
 
-/// Product entry point. Default methods = `[Gls]`; FAP is Baluev on H=1.
+/// Product entry point. Default methods = `[Gls, Pdm]`; FAP is Baluev on H=1.
 pub fn assess_periodicity(series: &Series, config: &PeriodSearchConfig) -> PeriodicityAssessment {
     if let Err(e) = config.validate() {
         let mut a = PeriodicityAssessment::new(PeriodicityDecision::Inconclusive, None);
@@ -176,10 +179,17 @@ fn assess_intra(
         let ww = series.weights();
         idx.iter().map(|&i| ww[i]).collect()
     };
-    let p_min = config
-        .min_period_s
-        .unwrap_or(3.0)
-        .max(2.0 * pass.median_dt_s);
+    let min_dt = idx
+        .windows(2)
+        .map(|w| t[w[1]] - t[w[0]])
+        .fold(f64::INFINITY, f64::min);
+    let min_dt = if min_dt.is_finite() {
+        min_dt
+    } else {
+        pass.median_dt_s
+    };
+    // Irregular sampling: the Eyer–Bartholdi bound is 2·min Δt, not 2·median.
+    let p_min = config.min_period_s.unwrap_or(3.0).max(2.0 * min_dt);
     let p_max = config
         .max_period_s
         .unwrap_or(f64::INFINITY)
@@ -403,6 +413,28 @@ fn search_and_decide(
                 p_star = p_h;
             }
         }
+        // Symmetric double-flash: H=1 locks on P/2. If PDM θ at 2P is at
+        // least as good, report the rotation period.
+        let two = 2.0 * p_star;
+        if two >= p_min && two <= p_max {
+            let m_tmp = pdm_bin_count(t.len(), config.pdm.m_bins);
+            let pdm_prefers_two =
+                match (pdm_theta(t, y, p_star, m_tmp), pdm_theta(t, y, two, m_tmp)) {
+                    (Some(th1), Some(th2)) => th2 <= th1 * 1.15,
+                    _ => false,
+                };
+            let resid = subtract_h1(t, y, w, p_star);
+            let p1_resid_two = gls_power_zero_mean(t, &resid, w, two, 1);
+            let p2_here = gls_power_zero_mean(t, y, w, p_star, 2);
+            let extra_h = p2_here - pgram_1.score[idx_1];
+            // Narrow flashes have extra H=2 power at P/2; a pure sine does not.
+            if pdm_prefers_two || p1_resid_two > 0.05 || extra_h > 0.03 {
+                notes.push(format!(
+                    "optical 2P promotion {p_star:.4} → {two:.4} (PDM={pdm_prefers_two}, resid_p1={p1_resid_two:.3})"
+                ));
+                p_star = two;
+            }
+        }
     }
     let score_h = pgram_h
         .score
@@ -502,16 +534,74 @@ fn search_and_decide(
         || n_beat_block == 0
         || fap_b > BALUEV_SKIP;
 
-    let decision =
-        if interior && !vetoed && look < config.fap_threshold && n_beat_perm == 0 && block_ok {
-            PeriodicityDecision::Periodic
-        } else {
-            PeriodicityDecision::NotPeriodic
-        };
+    let gls_ok = interior && !vetoed && look < config.fap_threshold && n_beat_perm == 0 && block_ok;
 
     if vetoed {
         notes.push(format!("window/alias veto at P={p_star:.4}"));
     }
+
+    let wants_pdm = config.methods.contains(&MethodId::Pdm);
+    let mut confirmation = None;
+    let mut agreement = if config.methods.len() <= 1 {
+        Some(true)
+    } else if !wants_pdm {
+        Some(true)
+    } else {
+        None
+    };
+    let mut pdm_inconclusive = false;
+
+    if wants_pdm && config.methods.len() > 1 {
+        let m = pdm_bin_count(t.len(), config.pdm.m_bins);
+        let pgram_pdm = pdm_periodogram(t, y, &pgram_1.period_s, m);
+        match argmin_finite(&pgram_pdm.score) {
+            None => {
+                notes.push("PDM occupancy: no valid trial".into());
+                if config.require_method_agreement {
+                    pdm_inconclusive = true;
+                }
+                agreement = None;
+            }
+            Some(ip) => {
+                let p_pdm = pgram_pdm.period_s[ip];
+                let th = pgram_pdm.score[ip];
+                let optical = series.meta().modality != crate::entities::series::Modality::RfPower;
+                let agree = periods_agree(p_star, p_pdm, optical);
+                agreement = Some(agree);
+                if agree && optical {
+                    let longer = p_star.max(p_pdm);
+                    if (longer - p_star).abs() / p_star.max(1e-12) > 0.02 {
+                        notes.push(format!(
+                            "optical 2:1/agreement: report longer {p_star:.4} → {longer:.4}"
+                        ));
+                        p_star = longer;
+                    }
+                }
+                confirmation = Some(Confirmation {
+                    method: MethodId::Pdm,
+                    period_s: p_pdm,
+                    score: th,
+                    agrees: agree,
+                });
+                if !agree {
+                    notes.push(format!("GLS–PDM disagree: GLS={p_star:.4} PDM={p_pdm:.4}"));
+                    if config.require_method_agreement && gls_ok && look < config.fap_threshold {
+                        pdm_inconclusive = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let agreement_ok = !config.require_method_agreement || agreement.unwrap_or(false);
+
+    let decision = if pdm_inconclusive {
+        PeriodicityDecision::Inconclusive
+    } else if gls_ok && agreement_ok {
+        PeriodicityDecision::Periodic
+    } else {
+        PeriodicityDecision::NotPeriodic
+    };
 
     let quality = QualityFlags {
         n: series.len(),
@@ -520,7 +610,7 @@ fn search_and_decide(
         window_contaminated: vetoed,
         undersampled: false,
         detrended: config.detrend != DetrendMode::None,
-        estimator_agreement: Some(true), // vacuous: methods=[Gls]
+        estimator_agreement: agreement,
         bound_snap: !interior,
     };
 
@@ -546,12 +636,24 @@ fn search_and_decide(
         quality,
         periodogram: pgram_1,
         periodogram_h2: if h > 1 { Some(pgram_h) } else { None },
-        confirmation: None,
+        confirmation,
         sampling: sampling.clone(),
         detrend,
         method: MethodId::Gls,
         notes,
     }
+}
+
+fn periods_agree(p1: f64, p2: f64, optical: bool) -> bool {
+    let lo = p1.min(p2);
+    let hi = p1.max(p2);
+    if lo <= 0.0 {
+        return false;
+    }
+    if (hi - lo) / lo < 0.03 {
+        return true;
+    }
+    optical && (hi - 2.0 * lo).abs() / lo < 0.05
 }
 
 fn local_df(periods: &[f64], idx: usize) -> f64 {
@@ -765,6 +867,29 @@ mod tests {
 
     fn leo_week() -> Vec<f64> {
         leo_pass_times(18, 40, 480.0, 5400.0, 0.0)
+    }
+
+    fn geo_night_times_irregular(
+        n_nights: usize,
+        pts_per_night: usize,
+        night_len_s: f64,
+        t0: f64,
+        seed: u64,
+    ) -> Vec<f64> {
+        let mut t = Vec::with_capacity(n_nights * pts_per_night);
+        let mut s = seed;
+        for n in 0..n_nights {
+            let start = t0 + n as f64 * crate::constants::SOLAR_DAY_S;
+            let mut night = Vec::with_capacity(pts_per_night);
+            for _ in 0..pts_per_night {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                let u = (s as f64) / (u64::MAX as f64);
+                night.push(start + u * night_len_s);
+            }
+            night.sort_by(|a, b| a.total_cmp(b));
+            t.extend(night);
+        }
+        t
     }
 
     fn cfg() -> PeriodSearchConfig {
@@ -1122,5 +1247,90 @@ mod tests {
         let s = series_of(t.clone(), vec![0.0; t.len()], None);
         let a = assess_periodicity(&s, &cfg());
         assert_eq!(a.decision, PeriodicityDecision::Inconclusive);
+    }
+
+    fn tumbler(t: &[f64], p_rot: f64, amp1: f64, amp2: f64, width: f64) -> Vec<f64> {
+        t.iter()
+            .map(|&ti| {
+                let phi = (ti / p_rot).rem_euclid(1.0);
+                let g = |center: f64, amp: f64| {
+                    let mut d = phi - center;
+                    if d > 0.5 {
+                        d -= 1.0;
+                    }
+                    if d < -0.5 {
+                        d += 1.0;
+                    }
+                    -amp * (-d * d / (2.0 * width * width)).exp()
+                };
+                12.0 + g(0.20, amp1) + g(0.70, amp2)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn t7_leo_asymmetric_tumbler() {
+        let t = leo_week();
+        let y = tumbler(&t, 195.0, 0.8, 0.4, 0.04);
+        let s = series_of(t, y, None);
+        let mut c = cfg();
+        c.min_period_s = Some(20.0);
+        c.max_period_s = Some(400.0);
+        let a = assess_periodicity(&s, &c);
+        assert_eq!(a.decision, PeriodicityDecision::Periodic, "{:?}", a.notes);
+        let p = a.period_s.unwrap();
+        assert!(
+            (p - 195.0).abs() / 195.0 < 0.02,
+            "expected 195 s not P/2, got {p}"
+        );
+        assert!((p - 97.5).abs() / 97.5 > 0.05, "must not report P/2 ({p})");
+    }
+
+    #[test]
+    fn t7s_leo_symmetric_tumbler_reports_full_period() {
+        let t = leo_week();
+        let y = tumbler(&t, 195.0, 0.6, 0.6, 0.04);
+        let s = series_of(t.clone(), y.clone(), None);
+        let mut c = cfg();
+        c.min_period_s = Some(20.0);
+        c.max_period_s = Some(400.0);
+        let a = assess_periodicity(&s, &c);
+        assert_eq!(a.decision, PeriodicityDecision::Periodic, "{:?}", a.notes);
+        let p = a.period_s.unwrap();
+        assert!(
+            (p - 195.0).abs() / 195.0 < 0.05,
+            "symmetric flashes must report P not P/2, got {p}"
+        );
+    }
+
+    #[test]
+    fn t8_geo_asymmetric_tumbler() {
+        // Irregular samples inside each night so 195 s is below the irregular
+        // Nyquist (80 even samples have 2Δt ≈ 456 s > 195 s).
+        let t = geo_night_times_irregular(7, 80, 18_000.0, 0.0, 7);
+        let y = tumbler(&t, 195.0, 0.8, 0.4, 0.04);
+        let s = series_of(t, y, None);
+        let mut c = cfg();
+        c.min_period_s = Some(20.0);
+        c.max_period_s = Some(400.0);
+        c.scale = SearchScale::IntraPass;
+        let a = assess_periodicity(&s, &c);
+        assert_eq!(a.decision, PeriodicityDecision::Periodic, "{:?}", a.notes);
+        let p = a.period_s.unwrap();
+        assert!((p - 195.0).abs() / 195.0 < 0.02, "got {p}");
+    }
+
+    #[test]
+    fn t15_22927_class() {
+        let t = geo_night_times_irregular(7, 80, 18_000.0, 0.0, 15);
+        let y = tumbler(&t, 195.0, 0.8, 0.4, 0.04);
+        let s = series_of(t, y, None);
+        let mut c = cfg();
+        c.min_period_s = Some(20.0);
+        c.max_period_s = Some(400.0);
+        let a = assess_periodicity(&s, &c);
+        assert_eq!(a.decision, PeriodicityDecision::Periodic, "{:?}", a.notes);
+        let p = a.period_s.unwrap();
+        assert!((p - 195.0).abs() / 195.0 < 0.05, "got {p}");
     }
 }
