@@ -218,9 +218,9 @@ fn is_interior_minimum(scores: &[(f64, f64)], idx: usize) -> bool {
 /// variation, `m = 1`) gives the same expression with `n_1 = N` and
 /// `W₀ = Σ (y - ȳ)²`. Their ratio is the Bayes factor — log-units.
 ///
-/// Bins with zero or one observations contribute nothing to either sum
-/// (treated as absent in the model) so periods that leave gaps aren't
-/// unfairly penalized.
+/// Occupancy: bins with \(n=0\) are empty; \(n=1\) adds a **global-mean**
+/// residual (not a free \(\mu_j\)). Occupied fraction \(< 0.4\) yields
+/// \(\log Z = -\infty\) so gappy folds are discarded, not rewarded.
 pub struct GregoryLoredoPeriodEstimator {}
 
 pub struct GregoryLoredoResult {
@@ -339,9 +339,29 @@ fn binned_log_z(lightcurve: &Lightcurve, period: f64, bins: usize) -> f64 {
 
     for o in &lightcurve.observations {
         let phase = fold_phase(o.unix_seconds(), period);
+        if !phase.is_finite() {
+            continue;
+        }
         let idx = ((phase * bins as f64) as usize).min(bins - 1);
         bin_data[idx].push(o.std_magnitude);
     }
+
+    let n_occ = bin_data.iter().filter(|xs| !xs.is_empty()).count();
+    if (n_occ as f64) < 0.4 * bins as f64 {
+        return f64::NEG_INFINITY;
+    }
+
+    let n_all = lightcurve.observations.len();
+    let global_mean = if n_all == 0 {
+        0.0
+    } else {
+        lightcurve
+            .observations
+            .iter()
+            .map(|o| o.std_magnitude)
+            .sum::<f64>()
+            / n_all as f64
+    };
 
     let mut sum_log_n = 0.0;
     let mut w_total = 0.0;
@@ -350,9 +370,14 @@ fn binned_log_z(lightcurve: &Lightcurve, period: f64, bins: usize) -> f64 {
 
     for xs in &bin_data {
         let nj = xs.len();
-        if nj < 2 {
-            // Bins with 0 or 1 obs contribute nothing — effectively dropped.
-            n_used += nj;
+        if nj == 0 {
+            continue;
+        }
+        if nj == 1 {
+            // Singleton: residual against the global mean, not a free μ_j.
+            let d = xs[0] - global_mean;
+            w_total += d * d;
+            n_used += 1;
             continue;
         }
         let mean: f64 = xs.iter().sum::<f64>() / nj as f64;
@@ -364,7 +389,7 @@ fn binned_log_z(lightcurve: &Lightcurve, period: f64, bins: usize) -> f64 {
     }
 
     if m_eff < 2 || n_used < m_eff + 1 {
-        return safe_ln(0.0);
+        return f64::NEG_INFINITY;
     }
 
     let dof = (n_used - m_eff) as f64;
@@ -1380,5 +1405,38 @@ mod tests {
                 "T13: must not report a search endpoint; got {p}"
             );
         }
+    }
+
+    #[test]
+    fn t19_clumped_constant_inherent_gl_rejects() {
+        // Two tight clumps far apart, nearly constant y. A gappy fold would
+        // occupy 1–2 of 12 bins and, before the occupancy fix, win against
+        // the constant model.
+        let base_time = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut observations = Vec::new();
+        for (t0, n) in [(0.0, 40), (10_000.0, 40)] {
+            for i in 0..n {
+                observations.push(Observation {
+                    vismag: 10.0,
+                    range_m: 1.0e6,
+                    phase_rad: 0.0,
+                    std_magnitude: 10.0 + 0.01 * ((i % 3) as f64 - 1.0),
+                    timestamp: base_time
+                        + chrono::Duration::milliseconds(((t0 + i as f64) * 1000.0) as i64),
+                    fractional_period: None,
+                });
+            }
+        }
+        let lc = Lightcurve::new(observations, Some(false), None);
+        let result = GregoryLoredoPeriodEstimator::estimate_period(
+            &lc, 100.0, 20_000.0, 0.01, None, None, None,
+        );
+        assert!(
+            result.period_s.is_none(),
+            "clumped constant y must not yield a period (log_odds = {})",
+            result.log_odds
+        );
     }
 }
