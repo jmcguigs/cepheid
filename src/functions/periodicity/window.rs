@@ -12,6 +12,7 @@
 //! \(W(0) = 1\). Peaks of \(W\) are sampling lines (pass cadence, 1 day, …).
 
 use crate::entities::assessment::{Periodogram, ScoreKind};
+use crate::functions::periodicity::gls::floating_mean_gls_power;
 use rayon::prelude::*;
 
 /// Sampling window \(W(f)\) at the given frequencies (Hz).
@@ -88,58 +89,6 @@ pub fn local_maxima(period_s: &[f64], score: &[f64], min_power: f64) -> Vec<(f64
         peaks.push((period_s[n - 1], score[n - 1]));
     }
     peaks
-}
-
-/// Zechmeister & Kürster 2009 floating-mean GLS power at one frequency.
-///
-/// Exposed so tests can prove `gls(y ≡ 1) ≈ 0` and is **not** \(W(f)\).
-/// Not the sampling-window primitive.
-pub fn floating_mean_gls_power(t_s: &[f64], y: &[f64], weights: &[f64], freq_hz: f64) -> f64 {
-    let n = t_s.len();
-    if n < 3 || y.len() != n || weights.len() != n {
-        return 0.0;
-    }
-    let wsum: f64 = weights.iter().sum();
-    if wsum <= 0.0 {
-        return 0.0;
-    }
-    let ybar: f64 = t_s
-        .iter()
-        .zip(y.iter())
-        .zip(weights.iter())
-        .map(|((_, yi), w)| w * yi)
-        .sum::<f64>()
-        / wsum;
-    let omega = std::f64::consts::TAU * freq_hz;
-    let mut c_sum = 0.0;
-    let mut s_sum = 0.0;
-    let mut yy = 0.0;
-    let mut yc = 0.0;
-    let mut ys = 0.0;
-    let mut cc = 0.0;
-    let mut ss = 0.0;
-    let mut cs = 0.0;
-    for i in 0..n {
-        let w = weights[i];
-        let yh = y[i] - ybar;
-        let (s, c) = (omega * t_s[i]).sin_cos();
-        c_sum += w * c;
-        s_sum += w * s;
-        yy += w * yh * yh;
-        yc += w * yh * c;
-        ys += w * yh * s;
-        cc += w * c * c;
-        ss += w * s * s;
-        cs += w * c * s;
-    }
-    cc -= c_sum * c_sum / wsum;
-    ss -= s_sum * s_sum / wsum;
-    cs -= c_sum * s_sum / wsum;
-    let det = cc * ss - cs * cs;
-    if yy <= 0.0 || det <= 0.0 {
-        return 0.0;
-    }
-    (yc * yc * ss + ys * ys * cc - 2.0 * yc * ys * cs) / (yy * det)
 }
 
 #[cfg(test)]
