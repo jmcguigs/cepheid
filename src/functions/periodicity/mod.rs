@@ -1,11 +1,17 @@
+pub mod assess;
+pub mod detrend;
+pub mod fap;
+pub mod gls;
 pub mod window;
+
+pub use assess::assess_periodicity;
 
 use crate::entities::lightcurve::Lightcurve;
 use crate::entities::observation::Observation;
 use nalgebra::{DMatrix, DVector};
-use rand::SeedableRng;
 use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
+use rand::SeedableRng;
 use rayon::prelude::*;
 
 /// Phase in `[0, 1)` for time `t_s` and period `period` (both seconds).
@@ -365,7 +371,11 @@ fn binned_log_z(lightcurve: &Lightcurve, period: f64, bins: usize) -> f64 {
 }
 
 fn safe_ln(x: f64) -> f64 {
-    if x <= 0.0 { 1.0e-300_f64.ln() } else { x.ln() }
+    if x <= 0.0 {
+        1.0e-300_f64.ln()
+    } else {
+        x.ln()
+    }
 }
 
 /// Lanczos approximation to log Γ(x); reflection for x < 0.5.

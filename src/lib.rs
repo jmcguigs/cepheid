@@ -1,6 +1,11 @@
-pub mod functions;
 pub mod constants;
 pub mod entities;
+pub mod functions;
+
+pub use crate::entities::assessment::{
+    PeriodSearchConfig, PeriodicityAssessment, PeriodicityDecision, SearchScale,
+};
+pub use crate::functions::periodicity::assess_periodicity;
 
 #[cfg(test)]
 mod tests {
@@ -18,7 +23,9 @@ mod tests {
         let obs_phase = 81.836_f64.to_radians(); // convert degrees to radians
         let std_phase = 90.0_f64.to_radians(); // half-illuminated standard phase
 
-        let result = functions::normalization::normalize_vismag(vismag, obs_range, std_range, obs_phase, std_phase);
+        let result = functions::normalization::normalize_vismag(
+            vismag, obs_range, std_range, obs_phase, std_phase,
+        );
 
         // Allow small tolerance for uncertainties in range and phase estimates
         let expected = 1.422;

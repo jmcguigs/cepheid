@@ -414,6 +414,51 @@ fn match_named(period: f64, named: &[(f64, AliasKind)], df: f64) -> Option<usize
     })
 }
 
+/// Evenly sampled points inside each LEO-like pass.
+pub fn leo_pass_times(
+    n_passes: usize,
+    pts_per_pass: usize,
+    pass_len_s: f64,
+    orbit_s: f64,
+    t0: f64,
+) -> Vec<f64> {
+    let mut t = Vec::with_capacity(n_passes * pts_per_pass);
+    let dt = if pts_per_pass > 1 {
+        pass_len_s / (pts_per_pass - 1) as f64
+    } else {
+        0.0
+    };
+    for p in 0..n_passes {
+        let start = t0 + p as f64 * orbit_s;
+        for i in 0..pts_per_pass {
+            t.push(start + i as f64 * dt);
+        }
+    }
+    t
+}
+
+/// GEO-like nightly windows starting every solar day.
+pub fn geo_night_times(
+    n_nights: usize,
+    pts_per_night: usize,
+    night_len_s: f64,
+    t0: f64,
+) -> Vec<f64> {
+    let mut t = Vec::with_capacity(n_nights * pts_per_night);
+    let dt = if pts_per_night > 1 {
+        night_len_s / (pts_per_night - 1) as f64
+    } else {
+        0.0
+    };
+    for n in 0..n_nights {
+        let start = t0 + n as f64 * crate::constants::SOLAR_DAY_S;
+        for i in 0..pts_per_night {
+            t.push(start + i as f64 * dt);
+        }
+    }
+    t
+}
+
 fn percentile(xs: &[f64], q: f64) -> f64 {
     if xs.is_empty() {
         return 0.0;
@@ -444,52 +489,8 @@ mod tests {
         .unwrap()
     }
 
-    /// LEO-week times: 18 passes, 40 pts, 480 s pass, 5400 s orbit.
     fn leo_week_times() -> Vec<f64> {
         leo_pass_times(18, 40, 480.0, 5400.0, 0.0)
-    }
-
-    fn leo_pass_times(
-        n_passes: usize,
-        pts_per_pass: usize,
-        pass_len_s: f64,
-        orbit_s: f64,
-        t0: f64,
-    ) -> Vec<f64> {
-        let mut t = Vec::with_capacity(n_passes * pts_per_pass);
-        let dt = if pts_per_pass > 1 {
-            pass_len_s / (pts_per_pass - 1) as f64
-        } else {
-            0.0
-        };
-        for p in 0..n_passes {
-            let start = t0 + p as f64 * orbit_s;
-            for i in 0..pts_per_pass {
-                t.push(start + i as f64 * dt);
-            }
-        }
-        t
-    }
-
-    fn geo_night_times(
-        n_nights: usize,
-        pts_per_night: usize,
-        night_len_s: f64,
-        t0: f64,
-    ) -> Vec<f64> {
-        let mut t = Vec::with_capacity(n_nights * pts_per_night);
-        let dt = if pts_per_night > 1 {
-            night_len_s / (pts_per_night - 1) as f64
-        } else {
-            0.0
-        };
-        for n in 0..n_nights {
-            let start = t0 + n as f64 * SOLAR_DAY_S;
-            for i in 0..pts_per_night {
-                t.push(start + i as f64 * dt);
-            }
-        }
-        t
     }
 
     fn peak_near(peaks: &[WindowPeak], period: f64, rel: f64) -> Option<&WindowPeak> {
