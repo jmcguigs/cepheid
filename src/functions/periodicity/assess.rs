@@ -1333,4 +1333,27 @@ mod tests {
         let p = a.period_s.unwrap();
         assert!((p - 195.0).abs() / 195.0 < 0.05, "got {p}");
     }
+
+    #[test]
+    fn t19_clumped_constant_assess_not_periodic() {
+        let mut t = Vec::new();
+        let mut y = Vec::new();
+        for (t0, n) in [(0.0, 40), (10_000.0, 40)] {
+            for i in 0..n {
+                t.push(t0 + i as f64);
+                y.push(10.0 + 0.01 * ((i % 3) as f64 - 1.0));
+            }
+        }
+        let s = series_of(t, y, None);
+        let mut c = cfg();
+        c.min_period_s = Some(100.0);
+        c.max_period_s = Some(20_000.0);
+        let a = assess_periodicity(&s, &c);
+        assert_ne!(
+            a.decision,
+            PeriodicityDecision::Periodic,
+            "clumped constant y must not be Periodic: {:?}",
+            a.notes
+        );
+    }
 }
