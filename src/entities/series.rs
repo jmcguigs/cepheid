@@ -324,6 +324,13 @@ impl Series {
         )
     }
 
+    pub fn from_rf_power(
+        samples: &[crate::entities::rf::RfPowerObservation],
+        cfg: &crate::entities::rf::RfNormConfig,
+    ) -> Result<Self, SeriesError> {
+        crate::functions::rf_normalization::standardize_rf(samples, cfg)
+    }
+
     pub fn t_s(&self) -> &[f64] {
         &self.t_s
     }
